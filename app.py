@@ -12,11 +12,21 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
+from segmentation_utils import (
+    DEFAULT_FEATURES,
+    MAX_CLUSTERS,
+    has_no_purchase_history,
+    load_customer_data,
+    predict_customer_cluster,
+    segment_names,
+)
+
 
 st.set_page_config(page_title="Customer Clustering", page_icon="🛍️", layout="wide")
 
 DATA_PATH = Path(__file__).with_name("ecommerce_user_segmentation.csv")
-DEFAULT_FEATURES = ("Recency", "Frequency", "Monetary")
+MIN_CLUSTERS = 2
+SILHOUETTE_SAMPLE_SIZE = 2000
 
 st.markdown(
     """<style>
@@ -32,28 +42,36 @@ st.markdown(
 
 @st.cache_data
 def load_data() -> pd.DataFrame:
-    return pd.read_csv(DATA_PATH).drop_duplicates().copy()
+    return load_customer_data(DATA_PATH)
 
 
-def segment_names(profile: pd.DataFrame) -> dict[int, str]:
-    """Give the anonymous K-Means clusters presentation-friendly labels."""
-    priority = profile["Monetary"].rank(pct=True) + profile["Frequency"].rank(pct=True) - profile["Recency"].rank(pct=True)
-    ordered = priority.sort_values(ascending=False).index.tolist()
-    labels = ["Champions", "Loyal Customers", "Potential Customers", "At-Risk Customers", "Low-Engagement Customers", "Other Customers"]
-    return {cluster: labels[position] for position, cluster in enumerate(ordered)}
+@st.cache_data
+def evaluate_clusters(scaled: np.ndarray) -> pd.DataFrame:
+    """Evaluate every selectable K; sample silhouette points for predictable runtime."""
+    scores = []
+    for candidate in range(MIN_CLUSTERS, MAX_CLUSTERS + 1):
+        model = KMeans(n_clusters=candidate, random_state=42, n_init=10)
+        labels = model.fit_predict(scaled)
+        scores.append(
+            {
+                "K": candidate,
+                "Inertia": model.inertia_,
+                "Silhouette": silhouette_score(
+                    scaled,
+                    labels,
+                    sample_size=min(SILHOUETTE_SAMPLE_SIZE, len(scaled)),
+                    random_state=42,
+                ),
+            }
+        )
+    return pd.DataFrame(scores)
 
 
 @st.cache_data
 def create_clusters(k: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     data = load_data()
     scaled = StandardScaler().fit_transform(data[list(DEFAULT_FEATURES)])
-
-    scores = []
-    for candidate in range(2, 9):
-        model = KMeans(n_clusters=candidate, random_state=42, n_init=10)
-        labels = model.fit_predict(scaled)
-        scores.append({"K": candidate, "Inertia": model.inertia_, "Silhouette": silhouette_score(scaled, labels)})
-    evaluation = pd.DataFrame(scores)
+    evaluation = evaluate_clusters(scaled)
 
     result = data.copy()
     result["Cluster"] = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(scaled)
@@ -78,10 +96,15 @@ def fitted_model(k: int) -> tuple[StandardScaler, KMeans]:
     return scaler, model
 
 
-data = load_data()
+try:
+    data = load_data()
+except (OSError, ValueError) as error:
+    st.error(f"Could not load the customer dataset: {error}")
+    st.stop()
+
 with st.sidebar:
     st.header("Settings")
-    k = st.slider("Number of clusters", 2, 6, 4)
+    k = st.slider("Number of clusters", MIN_CLUSTERS, MAX_CLUSTERS, 4)
     st.caption("The model uses Recency, Frequency, and Monetary value (RFM).")
 
 customers, profile, evaluation = create_clusters(k)
@@ -109,6 +132,7 @@ actions = {
     "At-Risk Customers": "Run a time-limited win-back campaign.",
     "Low-Engagement Customers": "Use low-cost reactivation emails and improve onboarding.",
     "Other Customers": "Review their behaviour before targeting with a tailored campaign.",
+    "No purchase history": "Use a welcome or first-purchase offer; do not treat this customer as at risk of churn.",
 }
 
 with st.container(border=True):
@@ -128,22 +152,30 @@ with st.container(border=True):
             predict_clicked = st.form_submit_button("Predict")
 
 if predict_clicked:
-    scaler, model = fitted_model(k)
-    cluster = int(model.predict(scaler.transform([[new_recency, new_frequency, new_monetary]]))[0])
-    predicted_segment = profile.loc[cluster, "Segment"]
-    st.success(f"Predicted segment: **{predicted_segment}** (Cluster {cluster})")
-    st.write("This customer was assigned here because their standardized RFM values are closest to this cluster's learned customer profile.")
-    comparison = pd.DataFrame(
-        {
-            "RFM measure": ["Recency (days)", "Frequency (orders)", "Monetary (total spend)"],
-            "New customer": [new_recency, new_frequency, new_monetary],
-            f"Average {predicted_segment}": [profile.loc[cluster, "Recency"], profile.loc[cluster, "Frequency"], profile.loc[cluster, "Monetary"]],
-        }
-    )
-    st.dataframe(comparison, use_container_width=True, hide_index=True)
-    recency_message = "recently" if new_recency <= profile.loc[cluster, "Recency"] else "less recently"
-    st.caption(f"Compared with the average {predicted_segment} customer, this customer purchased {recency_message}; K-Means considered Recency, Frequency, and Monetary together before choosing the nearest cluster.")
-    st.write(actions[predicted_segment])
+    if has_no_purchase_history(new_frequency, new_monetary):
+        st.info("Customer status: **No purchase history**")
+        st.write(
+            "Frequency and Monetary are both zero, so there is no recorded purchase to segment. "
+            "Recency is not meaningful until a purchase has occurred."
+        )
+        st.write(actions["No purchase history"])
+    else:
+        scaler, model = fitted_model(k)
+        cluster = predict_customer_cluster(scaler, model, [new_recency, new_frequency, new_monetary])
+        predicted_segment = profile.loc[cluster, "Segment"]
+        st.success(f"Predicted segment: **{predicted_segment}** (Cluster {cluster})")
+        st.write("This customer was assigned here because their standardized RFM values are closest to this cluster's learned customer profile.")
+        comparison = pd.DataFrame(
+            {
+                "RFM measure": ["Recency (days)", "Frequency (orders)", "Monetary (total spend)"],
+                "New customer": [new_recency, new_frequency, new_monetary],
+                f"Average {predicted_segment}": [profile.loc[cluster, "Recency"], profile.loc[cluster, "Frequency"], profile.loc[cluster, "Monetary"]],
+            }
+        )
+        st.dataframe(comparison, use_container_width=True, hide_index=True)
+        recency_message = "recently" if new_recency <= profile.loc[cluster, "Recency"] else "less recently"
+        st.caption(f"Compared with the average {predicted_segment} customer, this customer purchased {recency_message}; K-Means considered Recency, Frequency, and Monetary together before choosing the nearest cluster.")
+        st.write(actions[predicted_segment])
 
 st.divider()
 left, right = st.columns([1.35, 1])
@@ -169,6 +201,10 @@ with right:
     st.pyplot(fig, clear_figure=True)
 
 st.subheader("What the clusters mean")
+st.caption(
+    "Segment names are heuristic labels based on relative RFM cluster averages, not categories learned "
+    "from confirmed customer outcomes. Review each segment's metrics before acting on the suggestions."
+)
 display_profile = profile.reset_index()[["Cluster", "Segment", "Customers", "Recency", "Frequency", "Monetary"]]
 display_profile.columns = ["Cluster", "Segment", "Customers", "Days since last order", "Orders", "Total spend"]
 st.dataframe(display_profile, use_container_width=True, hide_index=True)
@@ -185,7 +221,10 @@ with st.expander("Why did we select this K?"):
     ax.legend()
     ax.grid(alpha=.2)
     st.pyplot(fig, clear_figure=True)
-    st.caption("A higher silhouette score indicates clearer separation between customer groups.")
+    st.caption(
+        "A higher silhouette score indicates clearer separation. Scores use up to 2,000 sampled customers "
+        "for faster evaluation; all customers are used when the dataset is smaller."
+    )
 
 export_columns = [column for column in customers if column not in ["PCA 1", "PCA 2"]]
 st.download_button("Download cluster results (CSV)", customers[export_columns].to_csv(index=False).encode("utf-8"), "customer_cluster_results.csv", "text/csv")
